@@ -1,4 +1,5 @@
 services:
+  # The legacy platform itself: Basic Auth -> session ID.
   - type: web
     name: api-basic-auth
     runtime: python
@@ -27,3 +28,27 @@ services:
         value: "true"
       - key: BASIC_AUTH_REALM
         value: "Legacy Platform"
+
+  # The MCP wrapper, served at /mcp. Holds no credentials: it forwards the
+  # Authorization header injected by the upstream gateway.
+  - type: web
+    name: api-basic-auth-mcp
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    # --http is required. Without it mcp_server.py runs in stdio mode and
+    # binds no port, so Render's health check never passes.
+    startCommand: python mcp_server.py --http $PORT
+    # /mcp rejects unauthenticated GETs by design, so it cannot serve as a
+    # health check. The platform's own /health is checked on its service.
+    envVars:
+      # Which platform instance to wrap. Points at the sibling service above.
+      - key: PLATFORM_BASE_URL
+        value: "https://api-basic-auth.onrender.com"
+      # Generous: the free plan sleeps when idle, and the first request after
+      # a sleep can take ~60s.
+      - key: HTTP_TIMEOUT_SECONDS
+        value: "90"
+      # PLATFORM_USERNAME and PLATFORM_PASSWORD are deliberately absent.
+      # The gateway injects credentials per request; setting them here would
+      # store a credential in this service, which the design avoids.
