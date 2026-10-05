@@ -1,0 +1,537 @@
+{
+  "info": {
+    "name": "Legacy Platform MCP — Tool Calls",
+    "description": "Calls the MCP server's tools over raw JSON-RPC, the way a gateway does.\n\nWhy requests 01 and 02 exist: the MCP streamable-HTTP transport requires a handshake. `initialize` returns an `mcp-session-id` response header, and every later request must echo it back — calling a tool without one returns `400 Bad Request: Missing session ID`. Request 01 captures that header into {{mcpSessionId}} automatically; a collection-level pre-request script attaches it to everything after.\n\nSo: run 01, then 02, then any tool request. Or just use Run Collection, which does them in order.\n\nThis collection plays the gateway's role by injecting `Authorization: Basic` itself (set at collection level from the {{username}}/{{password}} variables). That is exactly what the server expects the Bridge to do.\n\nResponses come back as Server-Sent Events, so the body looks like `event: message\\ndata: {...}`. A collection-level test script parses the JSON out of that and stores it in {{lastResult}}, and prints the tool's own payload to the Postman Console (View > Show Postman Console) where it is far easier to read.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "mcpUrl",
+      "value": "https://api-basic-auth-mcp.onrender.com/mcp",
+      "type": "string"
+    },
+    { "key": "username", "value": "svc_agent", "type": "string" },
+    {
+      "key": "password",
+      "value": "q3Fnt4Ak0p1jDNs0OXQGEz6awpxbK8f-",
+      "type": "string"
+    },
+    {
+      "key": "readerUsername",
+      "value": "analyst",
+      "type": "string",
+      "description": "Reader-role identity, for demonstrating the authorization difference."
+    },
+    {
+      "key": "readerPassword",
+      "value": "Kzg8vC7Ww_AW0h3cKpQX0LABHNcmivbm",
+      "type": "string"
+    },
+    { "key": "mcpSessionId", "value": "", "type": "string" },
+    { "key": "accountId", "value": "ACCT-1001", "type": "string" },
+    { "key": "lastResult", "value": "", "type": "string" }
+  ],
+  "auth": {
+    "type": "basic",
+    "basic": [
+      { "key": "username", "value": "{{username}}", "type": "string" },
+      { "key": "password", "value": "{{password}}", "type": "string" }
+    ]
+  },
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// Attach the MCP session id to every request except initialize.",
+          "// Without it the server replies 400 'Missing session ID'.",
+          "const name = pm.info.requestName || '';",
+          "if (!name.startsWith('01')) {",
+          "  const sid = pm.collectionVariables.get('mcpSessionId');",
+          "  if (!sid) {",
+          "    console.warn('No mcpSessionId yet — run \"01 — initialize\" first.');",
+          "  } else {",
+          "    pm.request.headers.upsert({ key: 'mcp-session-id', value: sid });",
+          "  }",
+          "}"
+        ]
+      }
+    },
+    {
+      "listen": "test",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// MCP replies as SSE: 'event: message\\ndata: {json}'. Pull out the JSON.",
+          "function parseRpc(raw) {",
+          "  if (!raw) return null;",
+          "  for (const line of raw.split('\\n')) {",
+          "    const t = line.trim();",
+          "    const body = t.startsWith('data:') ? t.slice(5).trim() : t;",
+          "    if (body.startsWith('{')) {",
+          "      try { return JSON.parse(body); } catch (e) { /* keep looking */ }",
+          "    }",
+          "  }",
+          "  return null;",
+          "}",
+          "",
+          "const rpc = parseRpc(pm.response.text());",
+          "if (rpc) {",
+          "  pm.collectionVariables.set('lastResult', JSON.stringify(rpc));",
+          "",
+          "  pm.test('JSON-RPC response carries no error', function () {",
+          "    pm.expect(rpc.error, rpc.error && rpc.error.message).to.be.undefined;",
+          "  });",
+          "",
+          "  // A tool result arrives as content[0].text holding the tool's JSON.",
+          "  const content = rpc.result && rpc.result.content;",
+          "  if (content && content.length && content[0].type === 'text') {",
+          "    let payload;",
+          "    try { payload = JSON.parse(content[0].text); } catch (e) { payload = content[0].text; }",
+          "    console.log(pm.info.requestName, '->', payload);",
+          "",
+          "    if (payload && typeof payload === 'object' && 'success' in payload) {",
+          "      // Requests named '(expect failure)' are asserting the error path.",
+          "      const wantsFailure = /expect failure/i.test(pm.info.requestName);",
+          "      pm.test(wantsFailure ? 'tool reports failure, as expected' : 'tool reports success', function () {",
+          "        pm.expect(payload.success).to.eql(!wantsFailure);",
+          "      });",
+          "      if (wantsFailure) {",
+          "        pm.test('failure includes an explanation', function () {",
+          "          pm.expect(payload.error, 'no error message').to.be.a('string').and.not.empty;",
+          "        });",
+          "      }",
+          "    }",
+          "  }",
+          "}"
+        ]
+      }
+    }
+  ],
+  "item": [
+    {
+      "name": "01 — initialize (run this first)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Accept", "value": "application/json, text/event-stream" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 1,\n  \"method\": \"initialize\",\n  \"params\": {\n    \"protocolVersion\": \"2024-11-05\",\n    \"capabilities\": {},\n    \"clientInfo\": { \"name\": \"postman\", \"version\": \"1.0\" }\n  }\n}"
+        },
+        "url": { "raw": "{{mcpUrl}}", "host": ["{{mcpUrl}}"] },
+        "description": "Opens the MCP session. The `mcp-session-id` RESPONSE header is captured into {{mcpSessionId}} and reused by every later request.\n\nIf a tool request returns `400 Missing session ID`, the session has expired or the server restarted — re-run this request."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200 OK', () => pm.response.to.have.status(200));",
+              "const sid = pm.response.headers.get('mcp-session-id');",
+              "pm.test('server returned an mcp-session-id header', () => {",
+              "  pm.expect(sid, 'header absent').to.be.a('string').and.not.empty;",
+              "});",
+              "if (sid) {",
+              "  pm.collectionVariables.set('mcpSessionId', sid);",
+              "  console.log('Captured mcp-session-id:', sid);",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "02 — notifications/initialized",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Accept", "value": "application/json, text/event-stream" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"method\": \"notifications/initialized\"\n}"
+        },
+        "url": { "raw": "{{mcpUrl}}", "host": ["{{mcpUrl}}"] },
+        "description": "Completes the handshake. This is a notification, so there is no response body and the server replies 202 Accepted."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('202 Accepted', () => pm.response.to.have.status(202));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "03 — tools/list",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Accept", "value": "application/json, text/event-stream" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 2,\n  \"method\": \"tools/list\"\n}"
+        },
+        "url": { "raw": "{{mcpUrl}}", "host": ["{{mcpUrl}}"] },
+        "description": "Lists the seven tools with their input schemas. This is what an agent reads to decide what it can call."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const raw = pm.response.text();",
+              "let rpc = null;",
+              "for (const line of raw.split('\\n')) {",
+              "  const t = line.trim();",
+              "  const b = t.startsWith('data:') ? t.slice(5).trim() : t;",
+              "  if (b.startsWith('{')) { try { rpc = JSON.parse(b); break; } catch (e) {} }",
+              "}",
+              "pm.test('returned a tool list', () => {",
+              "  pm.expect(rpc && rpc.result && rpc.result.tools).to.be.an('array').that.is.not.empty;",
+              "});",
+              "if (rpc && rpc.result && rpc.result.tools) {",
+              "  const names = rpc.result.tools.map(t => t.name);",
+              "  console.log('Tools:', names.join(', '));",
+              "  pm.test('all 7 tools present', () => pm.expect(names).to.have.lengthOf(7));",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "04 — credential_source (is injection working?)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Accept", "value": "application/json, text/event-stream" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 3,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"credential_source\",\n    \"arguments\": {}\n  }\n}"
+        },
+        "url": { "raw": "{{mcpUrl}}", "host": ["{{mcpUrl}}"] },
+        "description": "The diagnostic to reach for first. Reports the auth scheme and username the server received, never the password.\n\nWorking:        auth_scheme \"Basic\", username \"svc_agent\"\nGateway broken: auth_scheme \"Bearer\", username null — the gateway is relaying the agent's token instead of exchanging it for the vaulted credential."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const r = JSON.parse(pm.collectionVariables.get('lastResult') || '{}');",
+              "const c = r.result && r.result.content;",
+              "if (c && c.length) {",
+              "  const p = JSON.parse(c[0].text);",
+              "  pm.test('credential arrived as Basic', () => pm.expect(p.auth_scheme).to.eql('Basic'));",
+              "  pm.test('server stores no credentials of its own', () => pm.expect(p.holds_stored_credentials).to.be.false);",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "05 — platform_health (no credential needed)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Accept", "value": "application/json, text/event-stream" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 4,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"platform_health\",\n    \"arguments\": {}\n  }\n}"
+        },
+        "url": { "raw": "{{mcpUrl}}", "host": ["{{mcpUrl}}"] },
+        "description": "Reachability check that needs no credential. Call it first after an idle period: both Render free-tier services sleep, and this wakes the platform without burning a credentialed call on a 60-second timeout."
+      }
+    },
+    {
+      "name": "06 — whoami",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Accept", "value": "application/json, text/event-stream" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 5,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"whoami\",\n    \"arguments\": {}\n  }\n}"
+        },
+        "url": { "raw": "{{mcpUrl}}", "host": ["{{mcpUrl}}"] },
+        "description": "Which platform identity the call authenticated as. Expect auth_method \"basic\" and session_id null — the server forwards credentials rather than holding a session."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const r = JSON.parse(pm.collectionVariables.get('lastResult') || '{}');",
+              "const c = r.result && r.result.content;",
+              "if (c && c.length) {",
+              "  const p = JSON.parse(c[0].text);",
+              "  pm.test('platform saw Basic auth', () => pm.expect(p.auth_method).to.eql('basic'));",
+              "  pm.test('no session was minted', () => pm.expect(p.session_id).to.be.null);",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "07 — list_accounts",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Accept", "value": "application/json, text/event-stream" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 6,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"list_accounts\",\n    \"arguments\": {}\n  }\n}"
+        },
+        "url": { "raw": "{{mcpUrl}}", "host": ["{{mcpUrl}}"] },
+        "description": "All accounts with balance and status. Three in the mock data: ACCT-1001 Northwind Trading, ACCT-1002 Globex Industrial, ACCT-1003 Initech Holdings (suspended)."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const r = JSON.parse(pm.collectionVariables.get('lastResult') || '{}');",
+              "const c = r.result && r.result.content;",
+              "if (c && c.length) {",
+              "  pm.test('three accounts', () => pm.expect(JSON.parse(c[0].text).count).to.eql(3));",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "08 — get_account",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Accept", "value": "application/json, text/event-stream" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 7,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"get_account\",\n    \"arguments\": { \"account_id\": \"{{accountId}}\" }\n  }\n}"
+        },
+        "url": { "raw": "{{mcpUrl}}", "host": ["{{mcpUrl}}"] },
+        "description": "One account by ID. Change {{accountId}} in the collection variables to try ACCT-1002 or ACCT-1003.\n\nThis is the pattern for passing tool arguments: they go in params.arguments, matching the input schema from tools/list."
+      }
+    },
+    {
+      "name": "09 — get_account_transactions",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Accept", "value": "application/json, text/event-stream" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 8,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"get_account_transactions\",\n    \"arguments\": { \"account_id\": \"{{accountId}}\" }\n  }\n}"
+        },
+        "url": { "raw": "{{mcpUrl}}", "host": ["{{mcpUrl}}"] },
+        "description": "Transactions for an account. ACCT-1001 has two, ACCT-1002 has one, ACCT-1003 has none."
+      }
+    },
+    {
+      "name": "10 — list_platform_sessions (service role)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Accept", "value": "application/json, text/event-stream" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 9,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"list_platform_sessions\",\n    \"arguments\": {}\n  }\n}"
+        },
+        "url": { "raw": "{{mcpUrl}}", "host": ["{{mcpUrl}}"] },
+        "description": "Succeeds because svc_agent holds the platform's 'service' role. Compare with request 11, which sends the reader identity to the same tool."
+      }
+    },
+    {
+      "name": "11 — list_platform_sessions as reader (expect failure)",
+      "request": {
+        "auth": {
+          "type": "basic",
+          "basic": [
+            { "key": "username", "value": "{{readerUsername}}", "type": "string" },
+            { "key": "password", "value": "{{readerPassword}}", "type": "string" }
+          ]
+        },
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Accept", "value": "application/json, text/event-stream" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 10,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"list_platform_sessions\",\n    \"arguments\": {}\n  }\n}"
+        },
+        "url": { "raw": "{{mcpUrl}}", "host": ["{{mcpUrl}}"] },
+        "description": "The authorization demo. Same tool and same MCP server as request 10, but this one overrides collection auth to inject the reader credential — and the platform refuses it.\n\nThe refusal states that authentication succeeded and authorization did not, because the two need different fixes. Nothing in the MCP server implements this; the injected identity determines it."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const r = JSON.parse(pm.collectionVariables.get('lastResult') || '{}');",
+              "const c = r.result && r.result.content;",
+              "if (c && c.length) {",
+              "  const p = JSON.parse(c[0].text);",
+              "  pm.test('refusal is about authorization, not authentication', () => {",
+              "    pm.expect((p.error || '').toLowerCase()).to.include('authorization');",
+              "  });",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "12 — whoami as reader",
+      "request": {
+        "auth": {
+          "type": "basic",
+          "basic": [
+            { "key": "username", "value": "{{readerUsername}}", "type": "string" },
+            { "key": "password", "value": "{{readerPassword}}", "type": "string" }
+          ]
+        },
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Accept", "value": "application/json, text/event-stream" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 11,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"whoami\",\n    \"arguments\": {}\n  }\n}"
+        },
+        "url": { "raw": "{{mcpUrl}}", "host": ["{{mcpUrl}}"] },
+        "description": "Confirms the identity follows the injected credential: this reports analyst, with role reader, over the same MCP session as the svc_agent requests."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const r = JSON.parse(pm.collectionVariables.get('lastResult') || '{}');",
+              "const c = r.result && r.result.content;",
+              "if (c && c.length) {",
+              "  const p = JSON.parse(c[0].text);",
+              "  pm.test('identity follows the injected credential', () => pm.expect(p.username).to.eql('analyst'));",
+              "  pm.test('role is reader', () => pm.expect(p.role).to.eql('reader'));",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "13 — unknown account (expect failure)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Accept", "value": "application/json, text/event-stream" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 12,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"get_account\",\n    \"arguments\": { \"account_id\": \"ACCT-9999\" }\n  }\n}"
+        },
+        "url": { "raw": "{{mcpUrl}}", "host": ["{{mcpUrl}}"] },
+        "description": "A missing record comes back as {\"success\": false, \"error\": \"...\"} rather than raising, so a model can read and act on it. Note the JSON-RPC call itself still succeeds — the failure is in the tool's payload, not the protocol."
+      }
+    },
+    {
+      "name": "14 — bad credential (expect failure)",
+      "request": {
+        "auth": {
+          "type": "basic",
+          "basic": [
+            { "key": "username", "value": "{{username}}", "type": "string" },
+            { "key": "password", "value": "deliberately-wrong", "type": "string" }
+          ]
+        },
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Accept", "value": "application/json, text/event-stream" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 13,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"list_accounts\",\n    \"arguments\": {}\n  }\n}"
+        },
+        "url": { "raw": "{{mcpUrl}}", "host": ["{{mcpUrl}}"] },
+        "description": "What a stale or wrong vaulted credential looks like: the error points at the credential rather than blaming the platform."
+      }
+    },
+    {
+      "name": "15 — Bearer token instead of Basic (expect failure)",
+      "request": {
+        "auth": { "type": "noauth" },
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Accept", "value": "application/json, text/event-stream" },
+          {
+            "key": "Authorization",
+            "value": "Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.not.a.real.token"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 14,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"list_accounts\",\n    \"arguments\": {}\n  }\n}"
+        },
+        "url": { "raw": "{{mcpUrl}}", "host": ["{{mcpUrl}}"] },
+        "description": "Reproduces the gateway misconfiguration seen in practice: the gateway relays the agent's own Bearer token instead of exchanging it for the vaulted credential.\n\nThe server rejects it with an explicit scheme-mismatch message rather than forwarding it, so the failure names the real cause instead of surfacing as an opaque 401 from the platform."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const r = JSON.parse(pm.collectionVariables.get('lastResult') || '{}');",
+              "const c = r.result && r.result.content;",
+              "if (c && c.length) {",
+              "  const e = (JSON.parse(c[0].text).error || '').toLowerCase();",
+              "  pm.test('names the offending scheme', () => pm.expect(e).to.include('bearer'));",
+              "  pm.test('says the platform wants Basic', () => pm.expect(e).to.include('basic'));",
+              "  pm.test('tells the gateway to exchange the token', () => pm.expect(e).to.include('exchange'));",
+              "}"
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}
