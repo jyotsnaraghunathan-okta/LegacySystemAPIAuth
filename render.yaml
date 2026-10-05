@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: api-basic-auth
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    # main.py reads $PORT itself; uvicorn binds 0.0.0.0 so Render can route to it.
+    startCommand: python main.py
+    healthCheckPath: /health
+    envVars:
+      # Credentials as a JSON object: {"username":"password", ...}
+      # Set in the Render dashboard — never commit real values.
+      # Without this, main.py falls back to development defaults and logs a warning.
+      - key: API_USERS
+        sync: false
+      # Session lifetime in seconds (default 1800).
+      - key: SESSION_TTL_SECONDS
+        value: "1800"
+      # When true, each authenticated request pushes the expiry forward.
+      - key: SLIDING_EXPIRY
+        value: "true"
+      # Legacy platforms often use JSESSIONID or ASP.NET_SessionId.
+      - key: SESSION_COOKIE_NAME
+        value: "SESSIONID"
+      # Render terminates TLS, so the session cookie can be Secure.
+      - key: COOKIE_SECURE
+        value: "true"
+      - key: BASIC_AUTH_REALM
+        value: "Legacy Platform"

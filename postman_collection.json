@@ -1,0 +1,361 @@
+{
+  "info": {
+    "name": "Legacy Platform API — Basic Auth + Session",
+    "description": "Sample internal platform that authenticates with HTTP Basic Auth and issues a session ID.\n\nRun the requests top to bottom. `Login` captures the session_id into a collection variable automatically, so the requests after it need no manual copy/paste.\n\nVariables:\n- baseUrl: http://localhost:8000\n- username / password: service account credentials\n- sessionId: populated by Login\n",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:8000", "type": "string" },
+    { "key": "username", "value": "svc_agent", "type": "string" },
+    { "key": "password", "value": "local-dev-password", "type": "string" },
+    { "key": "readerUsername", "value": "analyst", "type": "string" },
+    { "key": "readerPassword", "value": "local-dev-password-2", "type": "string" },
+    { "key": "sessionId", "value": "", "type": "string" }
+  ],
+  "item": [
+    {
+      "name": "01 — Health (no auth)",
+      "request": {
+        "method": "GET",
+        "auth": { "type": "noauth" },
+        "header": [],
+        "url": { "raw": "{{baseUrl}}/health", "host": ["{{baseUrl}}"], "path": ["health"] },
+        "description": "Unauthenticated liveness probe. Confirms the server is reachable before you try auth."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200 OK', () => pm.response.to.have.status(200));",
+              "pm.test('status is ok', () => pm.expect(pm.response.json().status).to.eql('ok'));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "02 — Protected without auth (expect 401)",
+      "request": {
+        "method": "GET",
+        "auth": { "type": "noauth" },
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/api/accounts",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "accounts"]
+        },
+        "description": "Shows the challenge. Response carries WWW-Authenticate: Basic realm=\"Legacy Platform\"."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('401 Unauthorized', () => pm.response.to.have.status(401));",
+              "pm.test('carries Basic challenge', () => pm.expect(pm.response.headers.get('WWW-Authenticate')).to.include('Basic'));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "03 — Login (Basic Auth) -> session",
+      "request": {
+        "method": "POST",
+        "auth": {
+          "type": "basic",
+          "basic": [
+            { "key": "username", "value": "{{username}}", "type": "string" },
+            { "key": "password", "value": "{{password}}", "type": "string" }
+          ]
+        },
+        "header": [],
+        "url": { "raw": "{{baseUrl}}/login", "host": ["{{baseUrl}}"], "path": ["login"] },
+        "description": "Exchange username + password for a session ID. The test script saves session_id to the {{sessionId}} collection variable, and Postman's cookie jar stores the SESSIONID cookie automatically."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200 OK', () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test('returns a session_id', () => pm.expect(body.session_id).to.be.a('string').and.not.empty);",
+              "pm.collectionVariables.set('sessionId', body.session_id);",
+              "console.log('Saved sessionId:', body.session_id);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "04 — Login with wrong password (expect 401)",
+      "request": {
+        "method": "POST",
+        "auth": {
+          "type": "basic",
+          "basic": [
+            { "key": "username", "value": "{{username}}", "type": "string" },
+            { "key": "password", "value": "definitely-wrong", "type": "string" }
+          ]
+        },
+        "header": [],
+        "url": { "raw": "{{baseUrl}}/login", "host": ["{{baseUrl}}"], "path": ["login"] },
+        "description": "Returns the same generic message as an unknown user, so the response does not reveal whether the account exists."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": ["pm.test('401 Unauthorized', () => pm.response.to.have.status(401));"]
+          }
+        }
+      ]
+    },
+    {
+      "name": "05 — Whoami via X-Session-Id header",
+      "request": {
+        "method": "GET",
+        "auth": { "type": "noauth" },
+        "header": [{ "key": "X-Session-Id", "value": "{{sessionId}}" }],
+        "url": { "raw": "{{baseUrl}}/whoami", "host": ["{{baseUrl}}"], "path": ["whoami"] },
+        "description": "API-client style: carry the session in a header. auth_method should be 'session'."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200 OK', () => pm.response.to.have.status(200));",
+              "pm.test(\"auth_method is 'session'\", () => pm.expect(pm.response.json().auth_method).to.eql('session'));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "06 — List accounts (session)",
+      "request": {
+        "method": "GET",
+        "auth": { "type": "noauth" },
+        "header": [{ "key": "X-Session-Id", "value": "{{sessionId}}" }],
+        "url": {
+          "raw": "{{baseUrl}}/api/accounts",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "accounts"]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200 OK', () => pm.response.to.have.status(200));",
+              "pm.test('three accounts', () => pm.expect(pm.response.json().count).to.eql(3));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "07 — Get one account (session)",
+      "request": {
+        "method": "GET",
+        "auth": { "type": "noauth" },
+        "header": [{ "key": "X-Session-Id", "value": "{{sessionId}}" }],
+        "url": {
+          "raw": "{{baseUrl}}/api/accounts/ACCT-1002",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "accounts", "ACCT-1002"]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": ["pm.test('200 OK', () => pm.response.to.have.status(200));"]
+          }
+        }
+      ]
+    },
+    {
+      "name": "08 — Account transactions (session)",
+      "request": {
+        "method": "GET",
+        "auth": { "type": "noauth" },
+        "header": [{ "key": "X-Session-Id", "value": "{{sessionId}}" }],
+        "url": {
+          "raw": "{{baseUrl}}/api/accounts/ACCT-1001/transactions",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "accounts", "ACCT-1001", "transactions"]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200 OK', () => pm.response.to.have.status(200));",
+              "pm.test('two transactions', () => pm.expect(pm.response.json().count).to.eql(2));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "09 — Invalid session (expect 401)",
+      "request": {
+        "method": "GET",
+        "auth": { "type": "noauth" },
+        "header": [{ "key": "X-Session-Id", "value": "fabricated-session-id" }],
+        "url": { "raw": "{{baseUrl}}/whoami", "host": ["{{baseUrl}}"], "path": ["whoami"] }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": ["pm.test('401 Unauthorized', () => pm.response.to.have.status(401));"]
+          }
+        }
+      ]
+    },
+    {
+      "name": "10 — Agent path: Basic creds on every call",
+      "request": {
+        "method": "GET",
+        "auth": {
+          "type": "basic",
+          "basic": [
+            { "key": "username", "value": "{{username}}", "type": "string" },
+            { "key": "password", "value": "{{password}}", "type": "string" }
+          ]
+        },
+        "header": [],
+        "url": { "raw": "{{baseUrl}}/whoami", "host": ["{{baseUrl}}"], "path": ["whoami"] },
+        "description": "Skip the login hop entirely and send credentials directly. This is the simpler path for a client that holds service account credentials and does not cache a session. auth_method is 'basic' and session_id is null — no server-side session is created."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200 OK', () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test(\"auth_method is 'basic'\", () => pm.expect(body.auth_method).to.eql('basic'));",
+              "pm.test('no session minted', () => pm.expect(body.session_id).to.be.null);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "11 — Active sessions (service role)",
+      "request": {
+        "method": "GET",
+        "auth": {
+          "type": "basic",
+          "basic": [
+            { "key": "username", "value": "{{username}}", "type": "string" },
+            { "key": "password", "value": "{{password}}", "type": "string" }
+          ]
+        },
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/api/sessions",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "sessions"]
+        },
+        "description": "svc_agent has the 'service' role, so this succeeds. Session IDs come back as 8-character prefixes only."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": ["pm.test('200 OK', () => pm.response.to.have.status(200));"]
+          }
+        }
+      ]
+    },
+    {
+      "name": "12 — Active sessions as reader (expect 403)",
+      "request": {
+        "method": "GET",
+        "auth": {
+          "type": "basic",
+          "basic": [
+            { "key": "username", "value": "{{readerUsername}}", "type": "string" },
+            { "key": "password", "value": "{{readerPassword}}", "type": "string" }
+          ]
+        },
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/api/sessions",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "sessions"]
+        },
+        "description": "analyst authenticates fine but holds the 'reader' role — 403, not 401. Authentication succeeded; authorization did not."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": ["pm.test('403 Forbidden', () => pm.response.to.have.status(403));"]
+          }
+        }
+      ]
+    },
+    {
+      "name": "13 — Logout (revokes session)",
+      "request": {
+        "method": "POST",
+        "auth": { "type": "noauth" },
+        "header": [{ "key": "X-Session-Id", "value": "{{sessionId}}" }],
+        "url": { "raw": "{{baseUrl}}/logout", "host": ["{{baseUrl}}"], "path": ["logout"] }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200 OK', () => pm.response.to.have.status(200));",
+              "pm.test('revoked', () => pm.expect(pm.response.json().revoked).to.be.true);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "14 — Reuse session after logout (expect 401)",
+      "request": {
+        "method": "GET",
+        "auth": { "type": "noauth" },
+        "header": [{ "key": "X-Session-Id", "value": "{{sessionId}}" }],
+        "url": { "raw": "{{baseUrl}}/whoami", "host": ["{{baseUrl}}"], "path": ["whoami"] },
+        "description": "The session was revoked server-side, so the same ID no longer works."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": ["pm.test('401 Unauthorized', () => pm.response.to.have.status(401));"]
+          }
+        }
+      ]
+    }
+  ]
+}
