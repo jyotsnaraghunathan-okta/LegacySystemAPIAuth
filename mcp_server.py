@@ -1,34 +1,54 @@
 """
-MCP server wrapping the Legacy Platform API.
+MCP server exposing the Legacy Platform API as tools.
 
-This is the broker described in README.md. It holds the service account
-credentials, exchanges them for a session, caches that session for its TTL,
-and re-authenticates when the platform rejects it. Agents call the tools below
-and never see the password or the session ID.
+This server holds no credentials. An upstream gateway authenticates the agent,
+retrieves the vaulted service account credential, and injects it as an
+`Authorization: Basic` header on the inbound MCP request. This server reads
+that header per call and forwards it to the platform.
 
-Why a cache at all: the platform issues a session precisely so callers can
-amortize one credential check across many requests. Sending Basic Auth on
-every call would work (the platform accepts it) but throws that away.
+    Agent --(agent's own identity)--> Gateway --(Authorization: Basic)--> this
+                                     holds the vaulted credential            |
+                                                                             v
+                                                                        Platform
+
+Consequences of that design, and the reason it is preferable:
+
+  - No secret exists in this process, its environment, or its config. Nothing
+    here can leak a credential it never had.
+  - No session cache. Credentials arrive per request, so there is no shared
+    state to go stale, no re-login logic, and no cross-agent session reuse.
+  - The gateway stays the single point of credential rotation and audit.
+
+Because the credential is per-request, each call carries whichever identity
+the gateway resolved for that agent. The platform's own role check then
+applies to that identity — a reader-role agent is refused
+`list_platform_sessions` even though a service-role agent is not.
 
 Run:
-    python mcp_server.py                 # stdio, for Claude Desktop / MCP clients
-    python mcp_server.py --http 8001     # HTTP, for remote clients
+    python mcp_server.py --http 8001     # HTTP; required for header injection
+    python mcp_server.py                 # stdio; see FALLBACK below
+
+FALLBACK (local development only): stdio has no inbound HTTP headers, so
+there is nothing to inject. If PLATFORM_USERNAME and PLATFORM_PASSWORD are
+set, they are used instead, letting you exercise the tools without a gateway
+in front. Leave them unset in any deployment that sits behind one.
 
 Config:
-    PLATFORM_BASE_URL   platform root, e.g. https://api-basic-auth.onrender.com
-    PLATFORM_USERNAME   service account username
-    PLATFORM_PASSWORD   service account password
+    PLATFORM_BASE_URL        platform root, e.g. https://api-basic-auth.onrender.com
+    HTTP_TIMEOUT_SECONDS     request timeout (default 90)
+    PLATFORM_USERNAME        dev fallback only; omit behind a gateway
+    PLATFORM_PASSWORD        dev fallback only; omit behind a gateway
 """
 
-import asyncio
+import base64
 import os
 import sys
-from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Optional
 
 import httpx
 from dotenv import load_dotenv
 from fastmcp import FastMCP
+from fastmcp.server.dependencies import get_http_headers
 
 # Trust the OS certificate store rather than only certifi's bundle. Without
 # this, any network that terminates TLS for inspection (common on corporate
@@ -46,154 +66,99 @@ env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 load_dotenv(env_path)
 
 BASE_URL = os.getenv("PLATFORM_BASE_URL", "http://localhost:8000").rstrip("/")
-USERNAME = os.getenv("PLATFORM_USERNAME", "svc_agent")
-PASSWORD = os.getenv("PLATFORM_PASSWORD", "")
-
-# Re-login this many seconds before the platform's stated expiry, so a session
-# cannot lapse between our check and the platform receiving the request.
-EXPIRY_SKEW_SECONDS = int(os.getenv("EXPIRY_SKEW_SECONDS", "30"))
-
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT_SECONDS", "90"))
 
-if not PASSWORD:
+# Development fallback only. Unset behind a gateway.
+FALLBACK_USERNAME = os.getenv("PLATFORM_USERNAME", "")
+FALLBACK_PASSWORD = os.getenv("PLATFORM_PASSWORD", "")
+
+if FALLBACK_PASSWORD:
     print(
-        "WARNING: PLATFORM_PASSWORD is not set. Every tool call will fail "
-        "authentication until it is configured.",
+        "NOTE: PLATFORM_PASSWORD is set, so calls without an injected "
+        "Authorization header will fall back to it. Unset it when running "
+        "behind a gateway that injects credentials.",
         file=sys.stderr,
     )
 
 mcp = FastMCP("Legacy Platform")
 
 
-# ---------------------------------------------------------------------------
-# Session broker
-# ---------------------------------------------------------------------------
+class MissingCredential(Exception):
+    """No credential was injected and no fallback is configured."""
 
 
-class SessionBroker:
-    """Owns the credential -> session exchange and the cached session.
+def inbound_credential() -> str:
+    """Return the `Authorization` header value to forward to the platform.
 
-    The lock matters: tools run concurrently, and without it a burst of calls
-    arriving with no cached session would each kick off their own login,
-    minting a pile of sessions on the platform and racing to overwrite the
-    cache. One login, everyone else waits.
+    Prefers the header injected by the upstream gateway. Falls back to
+    configured credentials only when nothing was injected, which is the local
+    stdio development case.
     """
+    headers = get_http_headers()
+    injected = headers.get("authorization")
 
-    def __init__(self) -> None:
-        self._session_id: Optional[str] = None
-        self._expires_at: Optional[datetime] = None
-        self._lock = asyncio.Lock()
-        self.login_count = 0
-
-    def _is_fresh(self) -> bool:
-        if self._session_id is None or self._expires_at is None:
-            return False
-        return datetime.now(timezone.utc) < self._expires_at - timedelta(
-            seconds=EXPIRY_SKEW_SECONDS
-        )
-
-    def invalidate(self) -> None:
-        self._session_id = None
-        self._expires_at = None
-
-    async def _login(self, client: httpx.AsyncClient) -> str:
-        """Exchange credentials for a session. Caller must hold the lock."""
-        response = await client.post(f"{BASE_URL}/login", auth=(USERNAME, PASSWORD))
-        if response.status_code == 401:
-            raise PlatformAuthError(
-                "The platform rejected the service account credentials. Check "
-                "PLATFORM_USERNAME and PLATFORM_PASSWORD."
+    if injected:
+        scheme = injected.split(" ", 1)[0].lower()
+        if scheme != "basic":
+            # A Bearer token here means the gateway forwarded the agent's own
+            # token rather than exchanging it for the platform credential.
+            # Forwarding it would just produce a confusing 401 downstream.
+            raise MissingCredential(
+                f"The injected Authorization header uses the '{scheme}' scheme, but "
+                "the platform only accepts Basic. The gateway should exchange the "
+                "agent's token for the vaulted service account credential before "
+                "forwarding."
             )
-        response.raise_for_status()
-        body = response.json()
+        return injected
 
-        self._session_id = body["session_id"]
-        # Trust the platform's own expiry rather than assuming the TTL, since
-        # the platform may apply a different one than we expect.
-        try:
-            self._expires_at = datetime.fromisoformat(
-                body["expires_at"].replace("Z", "+00:00")
-            )
-        except (KeyError, ValueError):
-            self._expires_at = datetime.now(timezone.utc) + timedelta(minutes=25)
+    if FALLBACK_USERNAME and FALLBACK_PASSWORD:
+        token = base64.b64encode(
+            f"{FALLBACK_USERNAME}:{FALLBACK_PASSWORD}".encode()
+        ).decode()
+        return f"Basic {token}"
 
-        self.login_count += 1
-        return self._session_id
-
-    async def session_id(self, client: httpx.AsyncClient) -> str:
-        """Return a usable session ID, logging in only when needed."""
-        if self._is_fresh():
-            return self._session_id  # type: ignore[return-value]
-        async with self._lock:
-            # Re-check: another coroutine may have logged in while we waited.
-            if self._is_fresh():
-                return self._session_id  # type: ignore[return-value]
-            return await self._login(client)
-
-    def describe(self) -> dict:
-        return {
-            "has_cached_session": self._session_id is not None,
-            "session_id_prefix": self._session_id[:8] if self._session_id else None,
-            "expires_at": self._expires_at.isoformat().replace("+00:00", "Z")
-            if self._expires_at
-            else None,
-            "considered_fresh": self._is_fresh(),
-            "logins_performed": self.login_count,
-        }
-
-
-class PlatformAuthError(Exception):
-    """The service account credentials themselves are bad — retrying won't help."""
-
-
-broker = SessionBroker()
+    raise MissingCredential(
+        "No credential available. This server expects an upstream gateway to "
+        "inject an 'Authorization: Basic' header carrying the vaulted service "
+        "account credential. For local development without a gateway, set "
+        "PLATFORM_USERNAME and PLATFORM_PASSWORD instead."
+    )
 
 
 async def call_platform(method: str, path: str) -> dict:
-    """Call the platform with the cached session, re-authenticating once on 401.
+    """Call the platform, forwarding the injected credential.
 
-    The single retry is the point of the whole broker: the platform's sessions
-    are in-memory, so a restart or a free-tier sleep silently invalidates them.
-    A 401 means "log in again", not "fail".
+    Sends Basic credentials directly rather than logging in for a session.
+    With a per-request credential there is nothing to amortize a session
+    across — and no shared cache means no stale-session failure mode.
     """
+    try:
+        authorization = inbound_credential()
+    except MissingCredential as exc:
+        return {"success": False, "error": str(exc)}
+
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
         try:
-            sid = await broker.session_id(client)
-        except PlatformAuthError as exc:
-            return {"success": False, "error": str(exc)}
-        except httpx.HTTPError as exc:
-            return {"success": False, "error": f"Could not reach the platform: {exc}"}
-
-        async def attempt(session_id: str) -> httpx.Response:
-            return await client.request(
+            response = await client.request(
                 method,
                 f"{BASE_URL}{path}",
-                headers={"X-Session-Id": session_id},
+                headers={"Authorization": authorization},
             )
-
-        try:
-            response = await attempt(sid)
-
-            if response.status_code == 401:
-                # Session died underneath us. Drop it and log in once more.
-                broker.invalidate()
-                try:
-                    sid = await broker.session_id(client)
-                except PlatformAuthError as exc:
-                    return {"success": False, "error": str(exc)}
-                response = await attempt(sid)
 
             if response.status_code == 401:
                 return {
                     "success": False,
-                    "error": "Still unauthorized after re-authenticating.",
+                    "error": (
+                        "The platform rejected the credential. It may be stale in "
+                        "the vault, or scoped to a different platform instance."
+                    ),
                 }
             if response.status_code == 403:
                 return {
                     "success": False,
                     "error": (
-                        "The platform refused this action for the service account's "
-                        "role. Authentication worked; authorization did not."
+                        "The platform refused this action for this identity's role. "
+                        "Authentication worked; authorization did not."
                     ),
                 }
             if response.status_code == 404:
@@ -261,7 +226,7 @@ async def get_account_transactions(account_id: str) -> dict:
 
 @mcp.tool
 async def whoami() -> dict:
-    """Show which platform identity the broker is authenticating as, and how."""
+    """Show which platform identity this call authenticated as, and how."""
     return await call_platform("GET", "/whoami")
 
 
@@ -269,18 +234,17 @@ async def whoami() -> dict:
 async def list_platform_sessions() -> dict:
     """List sessions currently active on the platform.
 
-    Requires the service account to hold the platform's 'service' role; a
-    reader-role account gets a refusal.
+    Requires the platform's 'service' role; a reader-role identity is refused.
     """
     return await call_platform("GET", "/api/sessions")
 
 
 @mcp.tool
 async def platform_health() -> dict:
-    """Check that the platform is reachable. Needs no authentication.
+    """Check that the platform is reachable. Needs no credential.
 
-    Use this to wake a sleeping free-tier deployment before other calls, or to
-    tell "the platform is down" apart from "the credentials are wrong".
+    Use this to wake a sleeping free-tier deployment, or to tell "the platform
+    is down" apart from "the credential was rejected".
     """
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
         try:
@@ -298,37 +262,42 @@ async def platform_health() -> dict:
 
 
 @mcp.tool
-async def session_status() -> dict:
-    """Inspect the broker's cached session: whether one is held and when it expires.
+async def credential_source() -> dict:
+    """Report where this call's credential came from, without revealing it.
 
-    Diagnostic. Reports only a short prefix of the session ID, never the full
-    value or the credentials.
+    Diagnostic for confirming the gateway is injecting correctly. Reports the
+    username and auth scheme only — never the password.
     """
+    headers = get_http_headers()
+    injected = headers.get("authorization")
+
+    source = "injected by gateway" if injected else (
+        "local fallback (PLATFORM_USERNAME/PASSWORD)"
+        if FALLBACK_USERNAME and FALLBACK_PASSWORD
+        else "none available"
+    )
+
+    username: Optional[str] = None
+    scheme: Optional[str] = None
+    if injected:
+        parts = injected.split(" ", 1)
+        scheme = parts[0]
+        if len(parts) == 2 and scheme.lower() == "basic":
+            try:
+                username = base64.b64decode(parts[1]).decode("utf-8").split(":", 1)[0]
+            except (ValueError, UnicodeDecodeError):
+                username = None
+    elif FALLBACK_USERNAME:
+        scheme, username = "Basic", FALLBACK_USERNAME
+
     return {
         "success": True,
         "platform": BASE_URL,
-        "authenticating_as": USERNAME,
-        "credentials_configured": bool(PASSWORD),
-        **broker.describe(),
+        "credential_source": source,
+        "auth_scheme": scheme,
+        "username": username,
+        "holds_stored_credentials": bool(FALLBACK_PASSWORD),
     }
-
-
-@mcp.tool
-async def refresh_session() -> dict:
-    """Discard the cached session and log in again.
-
-    Rarely needed — a 401 triggers this automatically. Useful after rotating
-    the service account password, or to confirm login works on demand.
-    """
-    broker.invalidate()
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
-        try:
-            await broker.session_id(client)
-        except PlatformAuthError as exc:
-            return {"success": False, "error": str(exc)}
-        except httpx.HTTPError as exc:
-            return {"success": False, "error": f"Could not reach the platform: {exc}"}
-    return {"success": True, "detail": "Re-authenticated.", **broker.describe()}
 
 
 if __name__ == "__main__":
@@ -338,12 +307,17 @@ if __name__ == "__main__":
             os.getenv("PORT", "8001")
         )
         print(
-            f"Legacy Platform MCP server on http://0.0.0.0:{port}/mcp "
-            f"-> {BASE_URL} as {USERNAME}",
+            f"Legacy Platform MCP server on http://0.0.0.0:{port}/mcp -> {BASE_URL} "
+            "(credentials expected via injected Authorization header)",
             file=sys.stderr,
         )
         mcp.run(transport="http", host="0.0.0.0", port=port)
     else:
         # stdio: nothing may touch stdout except the protocol itself.
-        print(f"Legacy Platform MCP server (stdio) -> {BASE_URL}", file=sys.stderr)
+        print(
+            f"Legacy Platform MCP server (stdio) -> {BASE_URL}. stdio carries no "
+            "HTTP headers, so credential injection is unavailable; using the "
+            "PLATFORM_USERNAME/PASSWORD fallback if set.",
+            file=sys.stderr,
+        )
         mcp.run()

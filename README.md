@@ -162,76 +162,89 @@ credentials when a cached session has gone stale.
 
 ## MCP server
 
-`mcp_server.py` is that broker, implemented. It exposes the platform to MCP
-clients as eight tools, holding the credentials and owning the session
-lifecycle so the client never sees either.
+`mcp_server.py` exposes the platform to MCP clients as seven tools. It holds
+**no credentials**. An upstream gateway authenticates the agent, retrieves the
+vaulted service account credential, and injects it as an `Authorization: Basic`
+header on the inbound MCP request; this server reads that header per call and
+forwards it to the platform.
+
+```
+Agent --(its own identity)--> Gateway --(Authorization: Basic)--> MCP server
+                        holds the vaulted credential                   |
+                                                                       v
+                                                                  Platform
+```
+
+The gateway is the component that brokers credentials. Keeping that
+responsibility there rather than here means:
+
+- **No secret exists in this process**, its environment, or its config.
+  Nothing here can leak a credential it never had.
+- **No session cache.** Credentials arrive per request, so there is no shared
+  state to go stale, no re-login logic, and no risk of one agent reusing
+  another's session.
+- **Credential rotation and audit stay in one place** — the gateway.
+
+Because the credential is per-request, each call carries whichever identity the
+gateway resolved. The platform's role check then applies to *that* identity: a
+reader-role agent is refused `list_platform_sessions` while a service-role
+agent is not, with no logic here.
 
 | Tool | Description |
 |---|---|
 | `list_accounts` | List all accounts |
 | `get_account` | Get one account by ID |
 | `get_account_transactions` | List an account's transactions |
-| `whoami` | Which platform identity the broker is using |
+| `whoami` | Which platform identity this call authenticated as |
 | `list_platform_sessions` | Active platform sessions (needs `service` role) |
-| `platform_health` | Reachability check; no auth, wakes a sleeping instance |
-| `session_status` | Whether a session is cached and when it expires |
-| `refresh_session` | Force a re-login |
+| `platform_health` | Reachability check; no credential, wakes a sleeping instance |
+| `credential_source` | Whether a credential was injected, and which username |
+
+Tools return `{"success": false, "error": "..."}` rather than raising, so the
+model can act on failures. The errors distinguish cases that need different
+fixes: a rejected credential, a role refusal (authentication worked,
+authorization did not), and an unreachable platform.
+
+`credential_source` is the tool to call when injection appears not to be
+working. It reports the username and auth scheme — never the password.
 
 ### Run it
 
 ```bash
-# configure the broker in .env: PLATFORM_BASE_URL / USERNAME / PASSWORD
-.venv/bin/python mcp_server.py                 # stdio, for MCP clients
-.venv/bin/python mcp_server.py --http 8001     # HTTP, at /mcp
+.venv/bin/python mcp_server.py --http 8001     # HTTP at /mcp; required for injection
 ```
 
-Tests (44 checks, runs the broker against the platform in-process):
+Point the gateway at `http://host:8001/mcp` and configure it to inject the
+vaulted credential as an `Authorization: Basic` header.
+
+Only `PLATFORM_BASE_URL` needs setting. Leave `PLATFORM_USERNAME` and
+`PLATFORM_PASSWORD` **unset** behind a gateway — they exist only as a local
+fallback (see below) and the server logs a warning when they are present.
+
+Tests (43 checks: tool logic in-process, plus a real-HTTP layer that runs both
+servers and injects the header the way a gateway would):
 
 ```bash
 .venv/bin/python mcp_smoke_test.py
 ```
 
-### Claude Desktop
+### Local development without a gateway
 
-Add to `claude_desktop_config.json`:
+stdio carries no HTTP headers, so there is nothing to inject. For local
+testing, set `PLATFORM_USERNAME` and `PLATFORM_PASSWORD` and the server uses
+them when no header arrives:
 
-```json
-{
-  "mcpServers": {
-    "legacy-platform": {
-      "command": "/absolute/path/to/APIBasicAuth/.venv/bin/python",
-      "args": ["/absolute/path/to/APIBasicAuth/mcp_server.py"],
-      "env": {
-        "PLATFORM_BASE_URL": "https://your-service.onrender.com",
-        "PLATFORM_USERNAME": "svc_agent",
-        "PLATFORM_PASSWORD": "your-password"
-      }
-    }
-  }
-}
+```bash
+.venv/bin/python mcp_server.py                 # stdio, uses the fallback
 ```
 
-Absolute paths are required, and the Python must be the venv's so the
-dependencies resolve.
+This is a development convenience, not a deployment mode — it reintroduces
+exactly the stored credential the injection model is designed to avoid.
 
-### What the broker handles
+### If the gateway forwards a Bearer token
 
-- **One login, many calls.** The session is cached for its TTL rather than
-  re-authenticating per request.
-- **Re-login on 401.** The platform's sessions are in-memory, so a restart or
-  a free-tier sleep invalidates them silently. A 401 triggers one re-login and
-  a retry; the tool call succeeds and the client never learns anything
-  happened.
-- **Proactive refresh.** A session inside `EXPIRY_SKEW_SECONDS` of expiry is
-  replaced before use, so it cannot lapse between the check and the platform
-  receiving the request.
-- **One login under concurrent cold calls.** A lock serializes the exchange,
-  so a burst of simultaneous tool calls with no cached session produces a
-  single login rather than one per call.
-- **Errors come back as values**, not exceptions: every tool returns
-  `{"success": false, "error": "..."}` so the model can read what went wrong.
-  A 403 says explicitly that authentication worked and authorization did not,
-  since those imply different fixes.
-- **No credential leakage.** `session_status` reports an 8-character session
-  prefix and a `credentials_configured` boolean — never the password or the
-  full session ID.
+A `Bearer` token in the `Authorization` header is rejected with an explanatory
+error rather than forwarded. The platform only understands Basic auth, so
+passing the agent's own token through would produce a confusing 401 from the
+platform instead of a clear message here. The gateway needs to *exchange* the
+agent's token for the vaulted credential, not relay it.
