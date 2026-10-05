@@ -2,3 +2,8 @@ fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
 python-dotenv>=0.21.0
 httpx>=0.27.0
+# MCP server (mcp_server.py) only; the platform API itself does not need these.
+fastmcp==3.0.0b1
+# Lets httpx trust the OS certificate store, so networks that terminate TLS
+# for inspection do not fail with CERTIFICATE_VERIFY_FAILED.
+truststore>=0.9.0

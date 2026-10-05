@@ -159,3 +159,79 @@ one login across many calls. Sending Basic credentials on every request is the
 simpler option when calls are infrequent and caching a session is not worth
 the state — which is why this service accepts both, and why it falls back to
 credentials when a cached session has gone stale.
+
+## MCP server
+
+`mcp_server.py` is that broker, implemented. It exposes the platform to MCP
+clients as eight tools, holding the credentials and owning the session
+lifecycle so the client never sees either.
+
+| Tool | Description |
+|---|---|
+| `list_accounts` | List all accounts |
+| `get_account` | Get one account by ID |
+| `get_account_transactions` | List an account's transactions |
+| `whoami` | Which platform identity the broker is using |
+| `list_platform_sessions` | Active platform sessions (needs `service` role) |
+| `platform_health` | Reachability check; no auth, wakes a sleeping instance |
+| `session_status` | Whether a session is cached and when it expires |
+| `refresh_session` | Force a re-login |
+
+### Run it
+
+```bash
+# configure the broker in .env: PLATFORM_BASE_URL / USERNAME / PASSWORD
+.venv/bin/python mcp_server.py                 # stdio, for MCP clients
+.venv/bin/python mcp_server.py --http 8001     # HTTP, at /mcp
+```
+
+Tests (44 checks, runs the broker against the platform in-process):
+
+```bash
+.venv/bin/python mcp_smoke_test.py
+```
+
+### Claude Desktop
+
+Add to `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "legacy-platform": {
+      "command": "/absolute/path/to/APIBasicAuth/.venv/bin/python",
+      "args": ["/absolute/path/to/APIBasicAuth/mcp_server.py"],
+      "env": {
+        "PLATFORM_BASE_URL": "https://your-service.onrender.com",
+        "PLATFORM_USERNAME": "svc_agent",
+        "PLATFORM_PASSWORD": "your-password"
+      }
+    }
+  }
+}
+```
+
+Absolute paths are required, and the Python must be the venv's so the
+dependencies resolve.
+
+### What the broker handles
+
+- **One login, many calls.** The session is cached for its TTL rather than
+  re-authenticating per request.
+- **Re-login on 401.** The platform's sessions are in-memory, so a restart or
+  a free-tier sleep invalidates them silently. A 401 triggers one re-login and
+  a retry; the tool call succeeds and the client never learns anything
+  happened.
+- **Proactive refresh.** A session inside `EXPIRY_SKEW_SECONDS` of expiry is
+  replaced before use, so it cannot lapse between the check and the platform
+  receiving the request.
+- **One login under concurrent cold calls.** A lock serializes the exchange,
+  so a burst of simultaneous tool calls with no cached session produces a
+  single login rather than one per call.
+- **Errors come back as values**, not exceptions: every tool returns
+  `{"success": false, "error": "..."}` so the model can read what went wrong.
+  A 403 says explicitly that authentication worked and authorization did not,
+  since those imply different fixes.
+- **No credential leakage.** `session_status` reports an 8-character session
+  prefix and a `credentials_configured` boolean — never the password or the
+  full session ID.
