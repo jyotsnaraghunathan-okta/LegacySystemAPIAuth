@@ -46,9 +46,23 @@
           "host": ["{{baseUrl}}"],
           "path": ["api", "accounts"]
         },
-        "description": "Shows the challenge. Response carries WWW-Authenticate: Basic realm=\"Legacy Platform\"."
+        "description": "Shows the challenge. Response carries WWW-Authenticate: Basic realm=\"Legacy Platform\".\n\nClears the cookie jar first. On a first run the jar is empty anyway, but on any re-run it still holds SESSIONID from request 03 — which would authenticate this request and turn the expected 401 into a 200."
       },
       "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// 'Without auth' has to mean without a cookie too.",
+              "const jar = pm.cookies.jar();",
+              "const url = pm.environment.replaceIn(pm.collectionVariables.get('baseUrl'));",
+              "jar.clear(url, (err) => {",
+              "  if (err) { console.warn('Could not clear cookie jar:', err); }",
+              "});"
+            ]
+          }
+        },
         {
           "listen": "test",
           "script": {
@@ -216,15 +230,39 @@
       "request": {
         "method": "GET",
         "auth": { "type": "noauth" },
-        "header": [{ "key": "X-Session-Id", "value": "fabricated-session-id" }],
-        "url": { "raw": "{{baseUrl}}/whoami", "host": ["{{baseUrl}}"], "path": ["whoami"] }
+        "header": [
+          { "key": "X-Session-Id", "value": "fabricated-session-id" },
+          { "key": "Cookie", "value": "", "description": "Sent empty to suppress the jar's SESSIONID — see the pre-request script." }
+        ],
+        "url": { "raw": "{{baseUrl}}/whoami", "host": ["{{baseUrl}}"], "path": ["whoami"] },
+        "description": "A fabricated session ID must be rejected.\n\nThis request deliberately clears the SESSIONID cookie first. Without that, Postman's cookie jar still holds the valid cookie from request 03, and because the server resolves cookie -> header -> Basic, the valid cookie wins and this returns 200 with a real session — passing the request while testing nothing. Clearing the jar is what makes the X-Session-Id header the only credential in play."
       },
       "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// Clear SESSIONID so the fabricated header is the only credential sent.",
+              "const jar = pm.cookies.jar();",
+              "const url = pm.environment.replaceIn(pm.collectionVariables.get('baseUrl'));",
+              "jar.clear(url, (err) => {",
+              "  if (err) { console.warn('Could not clear cookie jar:', err); }",
+              "});"
+            ]
+          }
+        },
         {
           "listen": "test",
           "script": {
             "type": "text/javascript",
-            "exec": ["pm.test('401 Unauthorized', () => pm.response.to.have.status(401));"]
+            "exec": [
+              "pm.test('401 Unauthorized', () => pm.response.to.have.status(401));",
+              "// Guard: if a cookie slipped through, the 401 above would be a false pass.",
+              "pm.test('rejected the fabricated id, not a stale cookie', () => {",
+              "  pm.expect(pm.response.code, 'cookie jar leaked a valid session into this request').to.not.eql(200);",
+              "});"
+            ]
           }
         }
       ]
@@ -345,14 +383,33 @@
         "auth": { "type": "noauth" },
         "header": [{ "key": "X-Session-Id", "value": "{{sessionId}}" }],
         "url": { "raw": "{{baseUrl}}/whoami", "host": ["{{baseUrl}}"], "path": ["whoami"] },
-        "description": "The session was revoked server-side, so the same ID no longer works."
+        "description": "The session was revoked server-side, so the same ID no longer works.\n\nAs with request 09, the cookie jar is cleared first. Logout already clears SESSIONID via Set-Cookie, so this request would usually pass anyway — but only incidentally. Clearing the jar makes the revoked X-Session-Id the thing actually under test."
       },
       "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// Ensure the revoked X-Session-Id is the only credential sent.",
+              "const jar = pm.cookies.jar();",
+              "const url = pm.environment.replaceIn(pm.collectionVariables.get('baseUrl'));",
+              "jar.clear(url, (err) => {",
+              "  if (err) { console.warn('Could not clear cookie jar:', err); }",
+              "});"
+            ]
+          }
+        },
         {
           "listen": "test",
           "script": {
             "type": "text/javascript",
-            "exec": ["pm.test('401 Unauthorized', () => pm.response.to.have.status(401));"]
+            "exec": [
+              "pm.test('401 Unauthorized', () => pm.response.to.have.status(401));",
+              "pm.test('revoked session is not honoured via a stale cookie', () => {",
+              "  pm.expect(pm.response.code, 'cookie jar leaked a valid session into this request').to.not.eql(200);",
+              "});"
+            ]
           }
         }
       ]
